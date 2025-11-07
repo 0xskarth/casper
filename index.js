@@ -1,114 +1,67 @@
-// ========================================
-// CASPER | SCANNER - MODULAR ENTRY POINT
-// ========================================
-require('dotenv').config();
 const { Client, GatewayIntentBits } = require('discord.js');
-const fs = require('fs-extra');
-const path = require('path');
+require('dotenv').config();
+const ErrorHandler = require('./src/core/ErrorHandler');
+const QueueManager = require('./src/core/QueueManager');
+const SessionManager = require('./src/managers/SessionManager');
+const CSVFileWatcher = require('./src/managers/CSVFileWatcher');
+const LogService = require('./src/services/logService');
+const PresetService = require('./src/services/presetService');
+const NotificationService = require('./src/services/notificationService');
+const handleButtonInteraction = require('./src/handlers/buttonHandler');
+const handleSelectMenuInteraction = require('./src/handlers/selectMenuHandler');
+const handleModalSubmit = require('./src/handlers/modalHandler');
 
-// Import managers
-const SessionManager = require('./managers/SessionManager');
-const QueueManager = require('./managers/QueueManager');
-const CSVFileWatcher = require('./managers/CSVFileWatcher');
-const ErrorHandler = require('./managers/ErrorHandler');
-
-// Import services
-const { notifyListUpdate } = require('./services/notificationService');
-const { logToChannel } = require('./utils/logger');
-
-// ========================================
-// CLIENT INITIALIZATION
-// ========================================
 const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.DirectMessages
-    ],
-    partials: ['CHANNEL'], // ✅ Required for DM support
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers],
     restRequestTimeout: 30000,
     retryLimit: 3
 });
 
-// ========================================
-// GLOBAL MANAGERS
-// ========================================
-const sessionManager = new SessionManager(client);
 const queueManager = new QueueManager();
-const csvWatcher = new CSVFileWatcher();
+const sessionManager = new SessionManager(client, queueManager);
+const csvWatcher = new CSVFileWatcher('./data');
+const logService = new LogService(client, process.env.LOG_CHANNEL_ID);
+const presetService = new PresetService();
+const notificationService = new NotificationService(client, '1415668627444731955');
 
-// Attach to client for global access
-client.sessionManager = sessionManager;
-client.queueManager = queueManager;
-client.csvWatcher = csvWatcher;
-client.userPresetsSOL = new Map();
-client.userPresetsBSC = new Map();
+global.discordClient = client;
+global.queueManager = queueManager;
+global.sessionManager = sessionManager;
+global.presetService = presetService;
 
-// ========================================
-// LOAD EVENTS
-// ========================================
-const eventsPath = path.join(__dirname, 'events');
-const eventFiles = fs.readdirSync(eventsPath).filter(file => file.endsWith('.js'));
+ErrorHandler.setClient(client);
+ErrorHandler.setLogChannelId(process.env.LOG_CHANNEL_ID);
+csvWatcher.setLogService(logService);
 
-for (const file of eventFiles) {
-    const event = require(path.join(eventsPath, file));
-    if (event.once) {
-        client.once(event.name, (...args) => event.execute(...args, client));
-    } else {
-        client.on(event.name, (...args) => event.execute(...args, client));
-    }
-}
-
-// ========================================
-// CSV WATCHER EVENTS
-// ========================================
-csvWatcher.on('csv-updated', (fileName) => {
-    notifyListUpdate(client, fileName, 'updated');
+client.once('ready', async () => {
+    console.log('✅ Bot Online:', client.user.tag);
+    await csvWatcher.init();
+    csvWatcher.on('csv-updated', (f) => notificationService.notifyListUpdate(f, 'updated'));
+    csvWatcher.on('csv-added', (f) => notificationService.notifyListUpdate(f, 'added'));
+    csvWatcher.on('csv-removed', (f) => notificationService.notifyListUpdate(f, 'removed'));
+    await presetService.loadAllPresets();
+    await client.application.commands.set([{ name: 'scan', description: '🔮 Start Casper Scanner - Multi-Chain Trading Analysis' }]);
+    await logService.logToChannel(null, { title: '🚀 Scanner Started', description: 'Casper Scanner online!', color: '#00FF00' });
 });
 
-csvWatcher.on('csv-added', (fileName) => {
-    notifyListUpdate(client, fileName, 'added');
+client.on('interactionCreate', async (interaction) => {
+    await ErrorHandler.safeExecute(interaction.user.id, interaction.user.username, async () => {
+        if (interaction.isCommand()) {
+            if (interaction.commandName === 'scan') {
+                const session = await sessionManager.getSession(interaction.user.id, interaction.channelId);
+                await session.sendIntro(interaction);
+            }
+        } else {
+            const session = await sessionManager.getSession(interaction.user.id, interaction.channelId);
+            const deps = { sessionManager, logService, presetService, queueManager };
+            if (interaction.isButton()) await handleButtonInteraction(interaction, session, deps);
+            else if (interaction.isStringSelectMenu()) await handleSelectMenuInteraction(interaction, session, deps);
+            else if (interaction.isModalSubmit()) await handleModalSubmit(interaction, session, deps);
+        }
+    }, interaction);
 });
 
-csvWatcher.on('csv-removed', (fileName) => {
-    notifyListUpdate(client, fileName, 'removed');
-});
+process.on('unhandledRejection', (e) => console.error('[ERROR]', e));
+process.on('SIGINT', async () => { csvWatcher.stop(); await client.destroy(); process.exit(0); });
 
-// ========================================
-// ERROR HANDLING
-// ========================================
-process.on('unhandledRejection', (error) => {
-    console.error('[UNHANDLED_REJECTION]', error);
-    ErrorHandler.logError(client, 'SYSTEM', 'SYSTEM', error);
-});
-
-process.on('uncaughtException', (error) => {
-    console.error('[UNCAUGHT_EXCEPTION]', error);
-    ErrorHandler.logError(client, 'SYSTEM', 'SYSTEM', error);
-});
-
-// ========================================
-// GRACEFUL SHUTDOWN
-// ========================================
-process.on('SIGINT', async () => {
-    console.log('\n[SHUTDOWN] Shutting down gracefully...');
-    
-    csvWatcher.stop();
-    sessionManager.cleanup();
-    await client.destroy();
-    
-    console.log('[SHUTDOWN] ✅ Shutdown complete');
-    process.exit(0);
-});
-
-// ========================================
-// LOGIN
-// ========================================
-client.login(process.env.DISCORD_BOT_TOKEN).catch(error => {
-    console.error('❌ Failed to login:', error);
-    process.exit(1);
-});
-
-module.exports = { client, sessionManager, queueManager, csvWatcher };
+client.login(process.env.DISCORD_BOT_TOKEN).catch(e => { console.error('❌ Login failed:', e); process.exit(1); });
